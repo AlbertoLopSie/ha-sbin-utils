@@ -1,0 +1,870 @@
+#!/bin/bash
+
+###############################################################################
+#
+# rpi-snapshot is Copyright (c) 2019 Alberto Lopez Siemens
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted under the conditions of the BSD LICENSE file at
+# the rpi-snapshot github source repository:
+#    https://github.com/AlbertoLopSie/rpi-snapshot
+#
+# Some ideas and code portions borrowed from https://github.com/billw2/rpi-clone
+###############################################################################
+
+##################################################
+# Sets global variables
+##################################################
+version=1.1.1
+
+PGM=`basename $0`
+HOSTNAME=`hostname`
+rsync_options="--force -rltWDEHXAgoptx"
+
+snap=/mnt/snap
+snap_log=/var/log/$PGM.log
+cmdline_txt=/boot/cmdline.txt
+fstab=/etc/fstab
+
+booted_root_part=""
+
+
+##################################################
+# Verifies we are running as root
+##################################################
+if [ `id -u` != 0 ]
+then
+    echo -e "$PGM needs to be run as root.\n"
+    exit 1
+fi
+
+#########################################################
+# Ask for confirmation y returns 0: Yes, 1: No or aborts
+#  if 2nd arg is "abort"
+#########################################################
+confirm()
+	{
+	if ((unattended ))
+	then
+		return 0
+	fi
+	printf "\n%s  (yes/no): " "$1"
+	read resp
+	if [ "$resp" = "y" ] || [ "$resp" = "yes" ]
+	then
+		return 0
+	fi
+	if [ "$2" == "abort" ]
+	then
+		echo -e "Aborting!\n"
+		exit 0
+	fi
+	return 1
+	}
+
+##################################################
+# Checks all needed utilities are installed or
+# ask confirmation to install them
+##################################################
+commands="rsync parted fdisk findmnt column"
+packages="rsync parted util-linux mount bsdmainutils"
+need_packages=""
+
+idx=1
+for cmd in $commands
+do
+	if ! command -v $cmd > /dev/null
+	then
+		pkg=$(echo "$packages" | cut -d " " -f $idx)
+		printf "%-30s %s\n" "Command not found: $cmd" "Package required: $pkg"
+		need_packages="$need_packages $pkg"
+	fi
+	((++idx))
+done
+
+if [ "$need_packages" != "" ]
+then
+	confirm "Do you want to apt-get install the packages?" "abort"
+	apt-get install -y --no-install-recommends $need_packages
+fi
+
+
+readable()
+{
+	val=$1
+	if [ "$val" == "" ]
+	then
+		result="   ??"
+	else
+		blk_size=$2
+		val=$((val / 1000 * blk_size))
+
+		if ((val < 1000000))
+		then
+			result=$(echo $val \
+			| awk '{ byte =$1 /1000; printf "%.1f%s", byte, "MB" }')
+		elif ((val < 1000000000))
+		then
+			result=$(echo $val \
+			| awk '{ byte =$1 /1000/1000; printf "%.1f%s", byte, "GB" }')
+		else
+			result=$(echo $val \
+			| awk '{ byte =$1 /1000/1000/1000; printf "%.1f%s", byte, "TB" }')
+		fi
+	fi
+	printf -v "${3}" "%s" "$result"
+}
+
+qecho()
+{
+  if ((!quiet))
+    then
+    echo "$@"
+  fi
+}
+
+qprintf()
+{
+  if ((!quiet))
+	then
+  	printf "$@"
+  fi
+}
+
+##################################################
+# Displays usage help
+##################################################
+usage()
+{
+	echo $"
+usage: $PGM sdN {-v|--verbose} {-u|--unattended} {-q|--quiet}
+         {-c|--comment snapshot-comment}
+         {-S|--setup script}
+         {-y|--syncdir dir}
+         {-b|--boot-new-rootfs}
+         {--boot}
+         {-x} {-V|--version}
+
+    -v	    - verbose rsync, list all files as they are copied.
+    -u	    - unattended clone.  No confirmations asked,
+		          but aborts if disk needs initializing or on error.
+    -q      - quiet mode, no output unless errors or initializing. Implies -u.
+    -S scr  - Replaces standard setup script rpi-clone-setup with 'scr'
+    -y dir  - Add dir to a custom list of directories to sync.  dir is
+              sync'ed as part of root (on its mount point) and not as a
+              separate partition
+    -b      - Make snapshot rootfs at next boot. Modifies /boot/cmdline.txt
+              to mount snapshot partition as rootfs on next boot
+    --boot  - Same as above but reboots after setting next root partition
+    -c      - Add comment to snapshot logfile(s) ($snap_log)
+    -x      - use set -x for very verbose bash shell script debugging
+    -V      - print $PGM version.
+
+
+  Makes a bootable snapshot of rootfs on another partition
+
+  The idea is to be able to generate a quick snapshot of the active mounted rootfs
+  on another boot disk partition and optionally modify cmdline.txt on boot
+  partition to reboot later over that image.
+
+  The script modifies the fstab on cloned partition to the new partition structure
+
+    $ sudo $PGM sdg
+
+  Clones can be from a booted SD card or USB disk.  For a description, example
+  clone runs and example usage of above options, see the README.md at:
+
+      https://github.com/AlbertoLopSie/rpi-snapshot
+
+  A line logging a $PGM run is written to $snap_log.
+
+  Download:
+    git clone hhttps://github.com/AlbertoLopSie/rpi-snapshot
+"
+  exit 1
+}
+
+unmount_list()
+{
+	if [ "$1" == "" ]
+	then
+		return
+	fi
+	for dir in $1
+	do
+		qecho "  unmounting $dir"
+		if ! umount $dir
+		then
+			qecho "  Failed to unmount: $dir"
+		fi
+	done
+}
+
+mount_partition()
+{
+	qecho "  Mounting $1 on $2"
+
+	if ! mount $1 $2
+	then
+		echo "    Mount failure of $1 on $2."
+		if [ "$3" != "" ]
+		then
+			unmount_list $3
+		fi
+		echo "Aborting!"
+		exit 1
+	fi
+}
+
+############################################################
+# Hace rsync de $1 a $2 excluyendo los dirs indicados abajo
+# si $3 es "with-root-excludes". Caso contrario solo excluye
+# .gvfs y lost+found
+############################################################
+rsync_file_system()
+{
+	src_dir="$1"
+	dst_dir="$2"
+
+	qprintf "  => rsync $1 $2 $3 ..."
+
+  testing=0
+
+  if((!testing))
+  then
+  	if [ "$3" == "with-root-excludes" ]
+  	then
+  		rsync $rsync_options --delete \
+  			$exclude_swapfile \
+  			--exclude '.gvfs' \
+  			--exclude '/dev/*' \
+  			--exclude '/mnt/snap/*' \
+  			--exclude '/proc/*' \
+  			--exclude '/run/*' \
+  			--exclude '/sys/*' \
+  			--exclude '/tmp/*' \
+  			--exclude 'lost\+found/*' \
+  		$src_dir \
+  		$dst_dir
+  	else
+  		rsync $rsync_options --delete \
+  			--exclude '.gvfs' \
+  			--exclude 'lost\+found/*' \
+  		$src_dir \
+  		$dst_dir
+  	fi
+  fi
+
+  if [ "$rsync_extra_dirs" != "" ] && [ "$1" == "//" ]
+  then
+    qprintf "\n\nSyncing extra dirs:"
+    dirs=$rsync_extra_dirs
+    while [ "$dirs" != "" ]
+  	do
+      if( echo ${dirs} | grep -q "," )
+      then
+        adir=$(echo "$dirs" | sed -e "s/\(\S*\),\s*\(.*$\)/\1/")
+        dirs=$(echo "$dirs" | sed -e "s/\(\S*\),\s*\(.*$\)/\2/")
+      else
+        adir="$dirs"
+        dirs=""
+      fi
+
+    qprintf "\n  => rsync $adir/ $dst_dir$adir ..."
+
+    if((!testing))
+    then
+      rsync $rsync_options --delete \
+        $adir/ \
+    		$dst_dir$adir
+    fi
+
+    done
+    qprintf "\n"
+  fi
+#set +x
+	qecho ""
+}
+
+############################################################
+# Imprime los datos de las particiones seleccionadas
+# $src_disk_, $dst_disk_,
+############################################################
+print_partitions()
+{
+	if ((quiet))
+	then
+		return
+	fi
+	n_parts=$(( (n_src_parts >= n_dst_parts) ? n_src_parts : n_dst_parts ))
+
+	readable $src_disk_size "512" src_size_readable
+	readable $dst_disk_size "512" dst_size_readable
+
+	printf "\n%-43s%s" "Booted disk: $src_disk $src_size_readable"
+  echo $"
+----------------------------------------------------------"
+  out=$'Part,   Size,   Used,FS,Label\n'
+	for ((p = 1; p <= n_parts; p++))
+	do
+		if ((p <= n_src_parts && src_exists[p]))
+		then
+			readable "${src_size_sectors[p]}" "512" tmp
+			printf -v sectors_readable "%7s" $tmp
+
+      readable "${src_used_sectors[p]}" "512" tmp
+			printf -v used_readable "%7s" $tmp
+
+      if(( src_sync_part[p] ))
+      then
+        pname="$p ${src_name[p]}"
+      else
+        pname="  ${src_name[p]}"
+      fi
+
+			out=${out}$"$pname,$sectors_readable,$used_readable,${src_fs_type[p]},${src_label[p]},"
+		else
+			out=${out}$"  ,  ,  ,  ,  ,"
+		fi
+
+#		if ((p <= n_dst_parts && dst_exists[p]))
+#		then
+#			readable ${dst_size_sectors[p]} "512" tmp
+#			printf -v sectors_readable "%7s" $tmp
+#			out=${out}$"$p,$sectors_readable,${dst_fs_type[p]},${dst_label[p]},"
+#		else
+#			out=${out}$"  ,  ,  ,  ,"
+#		fi
+
+		out=${out}$'\n'
+	done
+
+	echo $"$out" | column -t -s ','
+
+	if ((alt_root_part_num > 0))
+	then
+		echo $"
+** Assuming destination root partition for the clone is $dst_part_base$root_part_num
+   The root FS mount is not from booted $src_disk.  It is ${src_root_dev#/dev/}"
+
+	fi
+#  echo $"
+#----------------------------------------------------------------------------------------"
+  echo $"----------------------------------------------------------"
+}
+
+get_src_disk()
+{
+  partition=${1#/dev/}
+#  disk=${partition:: -1}
+#  num="${partition: -1}"
+  disk=$(echo "$partition" | sed -e "s/\([a-zA-Z]\+\)\([0-9]\+\)/\1/")
+  num=$(echo "$partition" |  sed -e "s/\([a-zA-Z]\+\)\([0-9]\+\)/\2/")
+  if [[ $disk == *"mmcblk"* ]]
+  then
+  	SD_slot_boot=1
+  	disk=${disk:0:7}
+  	src_part_base=${disk}p
+  fi
+  printf -v "${2}" "%s" "$disk"
+  printf -v "${3}" "%s" "$num"
+}
+
+
+############################################################
+# Obtains info about source partitions
+############################################################
+
+src_boot_dev=`findmnt /boot -o source -n`
+src_root_dev=`findmnt / -o source -n`
+src_part_base=""
+
+boot_part_num=0
+alt_root_part_num=0
+
+
+if [ "$src_boot_dev" == "" ]
+then
+	get_src_disk "$src_root_dev" "src_disk" "unused"
+else
+	get_src_disk "$src_boot_dev" "src_disk" "boot_part_num"
+fi
+
+#set -x
+get_src_disk "$src_root_dev" "src_root_disk" "root_part_num"
+#set +x
+
+#get_src_disk "$src_root_dev" "src_root_disk" "root_part_num"
+
+if [ "$src_disk" == "" ]
+then
+	echo "Cannot find booted device."
+	exit 1
+fi
+
+if [ "$src_part_base" == "" ]
+then
+	src_part_base=$src_disk
+fi
+
+#set -x
+src_partition_table=$(parted -m "/dev/$src_disk" unit s print | tr -d ';')
+src_fdisk_table=$(fdisk -l /dev/$src_disk | grep "^/dev/")
+blkid_table=$(blkid)
+
+tmp=$(df | grep -e "^/dev/$src_disk" -e "^/dev/root" -e "$src_root_dev" \
+			| tr -s " ")
+dev=${src_root_dev#/dev/}
+src_df_table=$(echo "$tmp" | sed "s/root/$dev/")
+
+n_src_parts=$(echo "$src_partition_table" | tail -n 1 | cut -d ":" -f 1)
+src_disk_size=$(echo "$src_partition_table" \
+				| grep "^/dev/$src_disk" | cut -d ":" -f 2 | tr -d 's')
+
+line=$(fdisk -l /dev/$src_disk | grep "Disk identifier:")
+src_disk_ID=${line#*x}
+
+src_mount_table=$(findmnt -o source,target -n -l \
+				| grep -e "^/dev/$src_disk" -e "^$src_root_dev" | tr -s " ")
+n_mounts=$(echo "$src_mount_table" | wc -l)
+
+line=$(echo "$src_fdisk_table" | grep "Extended")
+if [ "$line" != "" ]
+then
+	dev=$(echo "$line" | cut -d " " -f 1)
+	ext_part_num="${dev: -1}"
+else
+	ext_part_num=0
+fi
+
+#set -x
+for ((p = 1; p <= n_src_parts; p++))
+do
+	line=$(echo "$src_partition_table" | grep -e "^${p}:")
+
+	if [ "$line" == "" ]
+	then
+		src_exists[p]=0
+		continue
+	fi
+	src_exists[p]=1
+
+	if ((p == root_part_num))
+	then
+		src_partition[p]=${src_root_dev#/dev/}
+		src_device[p]=$src_root_dev
+	else
+		src_partition[p]="${src_part_base}${p}"
+		src_device[p]="/dev/${src_partition[p]}"
+	fi
+
+  blkid=$(echo "$blkid_table" | grep -e "^${src_device[p]}:")
+  src_part_uuid[p]=$(echo "$blkid" | sed -e "s/\(.*\sUUID=\"\)\(\S\+\)\(\".*\)/\2/")
+  src_part_partuuid[p]=$(echo "$blkid" | sed -e "s/\(.*\sPARTUUID=\"\)\(\S\+\)\(\".*\)/\2/")
+
+  dfline=$(echo "$src_df_table" | grep -m 1 "^${src_device[p]}\s")
+  blocks=$(echo "$dfline" | cut -d " " -f 3)
+
+	# parted sectors are 512 bytes
+	src_start_sector[p]=$(echo "$line" | cut -d ":" -f 2 | tr -d 's')
+	src_size_sectors[p]=$(echo "$line" | cut -d ":" -f 4 | tr -d 's')
+#  src_used_sectors[p]=$(echo "$dfline" | cut -d " " -f 3)
+  src_used_sectors[p]=$((blocks * 2))
+
+	part_type=$(echo "$line" | cut -d ":" -f 5)
+
+	src_mounted_dir[p]=$(echo "$src_mount_table" \
+						| grep -m 1 -e "^${src_device[p]}\s" | cut -d " " -f 2)
+	if [ "${src_mounted_dir[p]}" != "" ]
+	then
+		src_sync_part[p]=1
+	else
+		src_sync_part[p]=0
+	fi
+
+	src_name[p]=""
+	if [ "$part_type" != "" ]
+	then
+		src_fs_type[p]="$part_type"
+	else
+		src_fs_type[p]="--"
+	fi
+	src_label[p]="--"
+
+	if [ "${src_mounted_dir[p]}" == "/" ]
+	then
+		src_name[p]="root"
+	#
+	# If root on device other than booted SD card, root_part_num assumed to be
+	# booted /boot part_num + 1 and alt_root_part_num  is from root device.
+	#
+	elif ((p == root_part_num)) && ((alt_root_part_num > 0))
+	then
+		src_name[p]="root**"
+	elif ((p == ext_part_num))
+	then
+		src_fs_type[p]="EXT"
+	elif [[ "$part_type" == *"linux-swap"* ]]
+	then
+		src_fs_type[p]="swap"
+	elif [ "${src_mounted_dir[p]}" != "" ]
+	then
+		src_name[p]="${src_mounted_dir[p]}"
+	fi
+
+	if [[ "$part_type" == *"ext"* ]]
+	then
+		label=`e2label ${src_device[p]} 2> /dev/null`
+		if [ "$label" != "" ]
+		then
+			src_label[p]="$label"
+		fi
+	fi
+  set +x
+done
+
+############################################################
+# Process command line
+############################################################
+
+# command line
+#
+setup_args=""
+edit_fstab_name=""
+ext_label=""
+verbose="no"
+log_comment=""
+
+usage_error=0
+unattended=0
+quiet=0
+make_rootfs_next_boot=0
+reboots=0
+rsync_extra_dirs=""
+
+#set -x
+while [ "$1" ]
+do
+	case "$1" in
+		-v|--verbose)
+			verbose="yes"
+			rsync_options=${rsync_options}v
+			;;
+		-u|--unattended)
+			unattended=1
+			;;
+		-q|--quiet)
+			unattended=1
+			quiet=1
+			rsync_options=${rsync_options}q
+			;;
+    -b|--boot-new-rootfs)
+			make_rootfs_next_boot=1
+			;;
+    --boot)
+			make_rootfs_next_boot=1
+      reboots=1
+			;;
+    -S|--script)
+      shift
+      if ! command -v $1 > /dev/null
+      then
+        echo "Cannot find script $1"
+        usage_error=1
+      fi
+      $setup_command = $1
+      ;;
+      -c|--comment)
+        shift
+        log_comment="$1"
+        ;;
+		-x)
+			set -x
+			;;
+    -y|--syncdir)
+			shift
+      if [ "$rsync_extra_dirs" == "" ]
+			then
+				rsync_extra_dirs="$1"
+			else
+				rsync_extra_dirs="$rsync_extra_dirs, $1"
+			fi
+			;;
+		-V|--version)
+			echo $PGM Version: $version
+			exit 0
+			;;
+		-h|--help)
+			usage
+			;;
+		*)
+			if [ "$dst_part" != "" ]
+			then
+				echo "Bad args"
+				usage
+			fi
+			dst_part=$1
+			;;
+	esac
+	shift
+done
+
+
+#########################################################
+# Starts determining source and target devices/partitions
+#########################################################
+
+if [ "$dst_part" = "" ]
+then
+	echo "No destination part given."
+	usage
+fi
+
+if [ -L "$dst_part"  ]
+then
+  dst_part=$(readlink -f $dst_part)
+#  echo "Destination is a symlink.: $dst_part"
+fi
+
+dir=`expr substr $dst_part 1 5`
+if [ "$dir" == "/dev/" ]
+then
+	dst_part=${dst_part#/dev/}
+fi
+
+chk_disk=`cat /proc/partitions | grep -m 1 $dst_part`
+
+if [ "$chk_disk" == "" ]
+then
+	echo $"
+  Cannot find '$dst_part' in the partition table.  The partition table is:"
+	cat /proc/partitions
+	exit 1
+fi
+
+dst_part_base=$dst_part
+
+############################################################
+# Verifica que el destino sea un disco y no una particion
+# para ello se fija si termina en digito
+############################################################
+if [[ ! ${chk_disk: -1} =~ ^[0-9]$ ]]
+then
+  qecho $"
+Target partition $dst_part does not ends with a digit so may be a device.
+$PGM requires partition names like 'sda1' and not device names like 'sda'."
+  qecho ""
+  exit 0
+fi
+
+src_root=${src_root_dev#/dev/}
+if [ "$src_root" == "$dst_part" ]
+then
+	echo "Destination partition $dst_part is the booted root.  Cannot clone!"
+	exit 1
+fi
+
+src_boot=${src_boot_dev#/dev/}
+if [ "$src_boot" == "$dst_part" ]
+then
+	echo "Destination partition $dst_part is the booted boot.  Cannot clone!"
+	exit 1
+fi
+
+print_part_info ()
+{
+  readable "${src_size_sectors[$2]}" "512" tmp
+  printf -v size "%7s" $tmp
+
+  readable "${src_used_sectors[$2]}" "512" tmp
+  printf -v used "%7s" $tmp
+
+  printf "%-8s %02d %-10s %7s %7s  %-5s  %-11s  %-16s %s\n"  \
+    "$1" \
+    "$2" \
+    "${src_device[$2]}" \
+    "$size" \
+    "$used" \
+    "${src_fs_type[$2]}" \
+    "${src_part_partuuid[$2]}" \
+    "${src_label[$2]}" \
+    "${src_name[$2]}"
+
+}
+
+############################################################
+# Gets info about destination partition
+############################################################
+
+#print_partitions
+#set -x
+dst_device="/dev/"$dst_part
+dest_disk=${dst_part:: 3}
+dst_part_num="${dst_part: 3}"
+
+root_part_cmdline=$(sed -e "s/\(.*\)\(root=PARTUUID=\)\(\S\+\)\(\s\+\)\(.*\)/\3/" $cmdline_txt)
+#fstab_root_line=$(grep "^[^#].*ARTUUID=\S\+\s\+\/\s\+.*" $fstab)
+root_part_fstab=$(grep "^[^#].*ARTUUID=\S\+\s\+\/\s\+.*" $fstab | sed -e "s/\(.*PARTUUID=\)\(\S\+\)\(\s\+.*\)/\2/")
+
+#printf "\n"
+#printf "root_part_cmdline: %s\n" "$root_part_cmdline"
+#printf "root_part_fstab  : %s\n" "$root_part_fstab"
+
+#printf "\nLines in fstab using part %s:\n" "$root_part_fstab"
+#grep "PARTUUID=.*$root_part_fstab\s\+.*" $fstab
+
+printf "\nPart     ## Dev           Size    Used  FS     PARTUUID     Label            Mount\n"
+printf "====================================================================================================\n"
+print_part_info "Boot"    "$boot_part_num"
+print_part_info "Source"  "$root_part_num"
+print_part_info "Dest"    "$dst_part_num"
+printf "\n"
+
+
+if [ ! -d $snap ]
+then
+	mkdir $snap
+fi
+
+# Do not include a dhpys swapfile in rsync.  It regenerates at boot.
+#
+if [ -f /etc/dphys-swapfile ]
+then
+	swapfile=`cat /etc/dphys-swapfile | grep ^CONF_SWAPFILE | cut -f 2 -d=`
+	if [ "$swapfile" = "" ]
+	then
+		swapfile=/var/swap
+	fi
+	exclude_swapfile="--exclude $swapfile"
+fi
+
+
+####################################################################
+# Checks that dest partition has the needed size
+####################################################################
+if ((${src_size_sectors[$dst_part_num]} < ${src_used_sectors[$root_part_num]}))
+then
+  readable ${src_used_sectors[$root_part_num]} "512" src_used_readable
+	readable ${src_size_sectors[$dst_part_num]}  "512" dst_size_readable
+
+  qprintf "%-12s : %s\n\n" "** FATAL **" \
+  "Partition $root_part_num: source used ($src_used_readable) > destination space ($dst_size_readable)"
+  exit 0
+fi
+
+confirm "Ok to proceed with the clone?" "abort"
+start_time=`date '+%d/%m/%y %H:%M:%S'`
+start_sec=$(date '+%s')
+
+sync
+qprintf "\nSyncing file systems (can take a long time)\n"
+
+
+####################################################################
+# 1- Montar la dest part en $snap
+####################################################################
+target_mpoint=$(findmnt ${src_device[$dst_part_num]} -n -o target)
+if [ "$target_mpoint" == "" ]
+then
+  target_mpoint=$snap
+  mount_partition ${src_device[$dst_part_num]} $snap ""
+  unmount_list="$snap"
+fi
+
+fstab_dest=${target_mpoint}${fstab}
+
+####################################################################
+# 2- Sync root
+####################################################################
+rsync_file_system "/" "$target_mpoint" "with-root-excludes"
+
+#set -x
+####################################################################
+# 3- Modify destinatiuon fstab entry for rootfs
+####################################################################
+
+# If fstab uses PARTUUID for rootfs
+if [ -f $fstab_dest ]
+then
+  qecho "√ Backing-up $fstab_dest as $fstab_dest".sav
+  cp $fstab_dest "$fstab_dest".sav
+
+  if grep "^\s*[^#]" "$fstab_dest" | grep -q "PARTUUID=\s*\S\+\s\+\/\s\+.*" $fstab_dest
+  then
+    # First comment all existing non-rootfs mountpoints for the new PARTUUID to avoid to be mounted twice
+    qecho "√ Editing $fstab_dest references in snapshot from ${src_part_partuuid[$root_part_num]} to ${src_part_partuuid[$dst_part_num]}"
+    sed  -i "s/\(^\s*[^#]*PARTUUID=\s*${src_part_partuuid[$dst_part_num]}\s\+\/\S.*\)/# \1/"  $fstab_dest
+    # Next replace rootfs mountpoint with new PARTUUID
+    sed -i "s/\(^\s*[^#].*ARTUUID=\s*\)${src_part_partuuid[$root_part_num]}\(\s\+\/\s\+.*\)/\1${src_part_partuuid[$dst_part_num]}\2/" $fstab_dest
+  elif grep "^\s*[^#]" "$fstab_dest" | grep -q "${src_device[$root_part_num]}\s\+\/\s\+"
+  then
+    qecho "√ Editing $fstab_dest references in snapshot from ${src_device[$root_part_num]} to ${src_device[$dst_part_num]}"
+    sed -i "s/\(^\s*[^#]*\)${src_device[$root_part_num]}\(\s\+\/\s\+.*\)/\1${src_device[$dst_part_num]}\2/" $fstab_dest
+  fi
+fi
+
+####################################################################
+# 4- Modify next boot part
+####################################################################
+
+if ((make_rootfs_next_boot))
+then
+  nxtroot $dst_part_num
+fi
+
+####################################################################
+# CLEANUP
+####################################################################
+rm -f $target_mpoint/etc/udev/rules.d/70-persistent-net.rules
+
+if [ "$setup_args" != "" ]
+then
+	qprintf "\nRunning setup script: $setup_command $setup_args\n"
+	$setup_command $setup_args
+fi
+
+
+####################################################################
+# Generate Log entries
+####################################################################
+date=`date '+%F %H:%M'`
+readable ${src_used_sectors[$root_part_num]} "512" src_used_readable
+#echo "$date  $HOSTNAME $PGM: snapshot ${src_device[$root_part_num]} to ${src_device[$dst_part_num]} copied ${src_used_readable} $log_comment" >> $snap_log
+rpi-snap-log $PGM ${src_device[$root_part_num]} ${src_device[$dst_part_num]} ${src_used_readable} "$log_comment"
+
+#echo "$date  $HOSTNAME $PGM: snapshot ${src_device[$root_part_num]} to ${src_device[$dst_part_num]} copied ${src_used_readable} $log_comment" >> ${target_mpoint}${snap_log}
+rpi-snap-log $PGM ${src_device[$root_part_num]} ${src_device[$dst_part_num]} ${src_used_readable} "$log_comment" ${target_mpoint}
+
+stop_sec=$(date '+%s')
+clone_sec=$((stop_sec - start_sec))
+stop_time=`date '+%d/%m/%y %H:%M:%S'`
+
+printf "\n========================================================================================\n"
+qecho "Done with snapshot to ${src_device[$dst_part_num]}"
+qprintf "   Start - %s    End - %s    Elapsed Time - %d:%02d\n" \
+		"$start_time" "$stop_time" "$((clone_sec / 60))" "$((clone_sec % 60))"
+
+####################################################################
+# Pause before unmounting partitions
+####################################################################
+
+if [ "$unmount_list" != "" ] && ((!unattended))
+then
+	echo -n $"
+Cloned partition is mounted on $target_mpoint for inspection or customizing.
+
+Hit Enter when ready to unmount the $unmount_list partition..."
+
+	read resp
+#  Hit Enter when ready to unmount the ${src_device[$dst_part_num]} partition..."
+  unmount_list "$unmount_list"
+fi
+
+printf "========================================================================================\n\n"
+
+if ((reboots))
+then
+  echo "Rebooting..."
+  reboot
+fi
+exit 0

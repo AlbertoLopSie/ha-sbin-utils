@@ -1,0 +1,53 @@
+#!/bin/bash
+
+###############################################################################
+#
+# sudotask is Copyright (c) 2019 Alberto Lopez Siemens
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted under the conditions of the BSD LICENSE file at
+# the rpi-snapshot github source repository:
+#    https://github.com/AlbertoLopSie/sudo_cmd
+#
+# creates a shell script to be executed by cron job sudoexec
+###############################################################################
+
+##################################################
+# Sets global variables
+##################################################
+version=1.0.0
+
+PGM=`basename $0`
+
+##################################################
+# Verifies <user> argument supplied
+##################################################
+if [ "$1" == "" ]
+then
+    printf "\n   usage: $PGM cmd <args>\n\n"
+    exit 1
+fi
+
+basedir="$HOME/.sudoexec"
+cmd="$basedir/$1.cmd"
+running="$basedir/$1.status"
+exstat="$basedir/$1.exit"
+stdout="$basedir/$1.stdout"
+
+cmdtext="#!/bin/bash\n"
+
+shift
+for var in "$@"
+do
+    cmdtext="$cmdtext$var "
+done
+
+#echo $cmd
+rm -f $exstat
+touch $exstat
+rm -f $stdout
+touch $stdout
+echo "Waiting" > $running
+echo -e $cmdtext > $cmd
+
+

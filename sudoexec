@@ -1,0 +1,72 @@
+#!/bin/bash
+
+###############################################################################
+#
+# sudo_cmd is Copyright (c) 2019 Alberto Lopez Siemens
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted under the conditions of the BSD LICENSE file at
+# the rpi-snapshot github source repository:
+#    https://github.com/AlbertoLopSie/sudo_cmd
+#
+# cron job to monitor files in /home/<user>/.sudoexec/*.cmd and executes them
+# under sudo privileges.
+#
+#    stdout is sent to *.stdout
+#    exit status is sent to *.status
+###############################################################################
+
+##################################################
+# Sets global variables
+##################################################
+version=1.0.0
+
+PGM=`basename $0`
+
+##################################################
+# Verifies we are running as root
+##################################################
+if [ `id -u` != 0 ]
+then
+    echo -e "\n$PGM needs to be run as root.\n"
+    exit 1
+fi
+
+##################################################
+# Verifies <user> argument supplied
+##################################################
+if [ "$1" == "" ]
+then
+    printf "\n   usage: $PGM <user>\n\n"
+    exit 1
+fi
+
+#exit
+
+FILES=/home/$1/.sudoexec/*.cmd
+
+for acmd in $FILES
+do
+  [ -e "$acmd" ] || continue
+  fname=$(echo "$acmd" | sed -e "s/\(.*\)\..*/\1/")
+  run="$fname.run"
+  stdout="$fname.stdout"
+  status="$fname.status"
+  exstat="$fname.exit"
+  bak="$fname.bak"
+
+  printf "\nExecuting $acmd sending stdout to $stdout and storing exit status in $exstat..."
+  echo "Running" > $status
+  mv $acmd $run
+  chmod +x $run
+  if eval $run &> $stdout; then
+    echo $? > $exstat
+    echo "Ok" > $status
+  else
+    echo $? > $exstat
+    echo "Error" > $status
+  fi
+  rm -f $bak
+  mv $run $bak
+done
+

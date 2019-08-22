@@ -1,0 +1,24 @@
+#!/bin/bash
+
+#################################################
+# Verifica que todos los comandos necesarios esten instalados
+# y pregunta si instalar los que no
+##################################################
+commands="rsync parted fdisk findmnt column fsck.vfat"
+packages="rsync parted util-linux mount bsdmainutils dosfstools"
+need_packages=""
+
+echo "PATH: $PATH"
+idx=1
+for cmd in $commands
+do
+	echo "which $cmd: $(which $cmd)"
+	if ! command -v $cmd > /dev/null
+	then
+		pkg=$(echo "$packages" | cut -d " " -f $idx)
+		printf "%-30s %s\n" "Command not found: $cmd" "Package required: $pkg"
+		need_packages="$need_packages $pkg"
+	fi
+	((++idx))
+done
+echo "Done!"
