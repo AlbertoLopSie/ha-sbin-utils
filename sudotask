@@ -24,19 +24,36 @@ PGM=`basename $0`
 ##################################################
 if [ "$1" == "" ]
 then
-    printf "\n   usage: $PGM cmd <args>\n\n"
-    exit 1
+  printf "\n   usage: $PGM cmd [-status ha-sensor] <args>\n\n"
+  exit 1
 fi
 
 basedir="$HOME/.sudoexec"
 cmd="$basedir/$1.cmd"
-running="$basedir/$1.status"
+status="$basedir/$1.status"
 exstat="$basedir/$1.exit"
 stdout="$basedir/$1.stdout"
+sensor="$basedir/$1.sensor"
 
 cmdtext="#!/bin/bash\n"
 
+report_status()
+{
+  echo $1 > $status
+
+  if [ "$ha_sensor" != "" ]; then
+    set_ha_sensor $ha_sensor $1
+  fi
+}
+
 shift
+if [ "$1" == "-status" ]; then
+  shift
+  ha_sensor=$1
+  echo -e $ha_sensor > $sensor
+  shift
+fi
+
 for var in "$@"
 do
     cmdtext="$cmdtext$var "
@@ -47,7 +64,6 @@ rm -f $exstat
 touch $exstat
 rm -f $stdout
 touch $stdout
-echo "Waiting" > $running
+#echo "Waiting" > $status
+report_status "Waiting"
 echo -e $cmdtext > $cmd
-
-

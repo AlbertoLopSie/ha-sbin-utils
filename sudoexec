@@ -43,6 +43,15 @@ fi
 
 #exit
 
+report_status()
+{
+  echo $1 > $status
+
+  if [ "$ha_sensor" != "" ]; then
+    set_ha_sensor $ha_sensor $1
+  fi
+}
+
 FILES=/home/$1/.sudoexec/*.cmd
 
 for acmd in $FILES
@@ -54,19 +63,23 @@ do
   status="$fname.status"
   exstat="$fname.exit"
   bak="$fname.bak"
+  sensor="$fname.sensor"
+  ha_sensor=$(cat $sensor)
 
   printf "\nExecuting $acmd sending stdout to $stdout and storing exit status in $exstat..."
-  echo "Running" > $status
+# echo "Running" > $status
+  report_status "Running"
   mv $acmd $run
   chmod +x $run
   if eval $run &> $stdout; then
     echo $? > $exstat
-    echo "Ok" > $status
+#   echo "Ok" > $status
+    report_status "Ok"
   else
     echo $? > $exstat
-    echo "Error" > $status
+#   echo "Error" > $status
+    report_status "Error ($?)"
   fi
   rm -f $bak
   mv $run $bak
 done
-

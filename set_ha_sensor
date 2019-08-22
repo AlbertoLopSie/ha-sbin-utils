@@ -1,0 +1,16 @@
+#!/bin/bash
+
+# Bearer Token provided by HA REST API
+TOKEN=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiIxZDYwNmQ1OWQ3NmQ0YjEyOWFlNmUzMjY5YTEzYWE0ZSIsImlhdCI6MTU2NjQ4MjgwMywiZXhwIjoxODgxODQyODAzfQ.BsynqpbN7xQrCUC5PyIS-6gdRq4P8YtUxdainWwGKAc
+
+sensor_name=$1
+sensor_value=$2
+sensor_attributes="$3"
+
+sensor_json='{"state": '$sensor_value
+if [ "$sensor_attributes" != "" ]; then
+  sensor_json=$sensor_json', "attributes": {'$sensor_attributes'}'
+fi
+sensor_json=$sensor_json'}'
+
+curl -X POST -H \"Authorization: Bearer $TOKEN\" -H \"Content-Type: application/json\"  -d \'$sensor_json\' http://localhost:8133/api/states/sensor.$sensor_name
