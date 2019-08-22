@@ -11,3 +11,16 @@ on another boot disk partition and optionally modify cmdline.txt on boot
 partition to reboot over that image
 
 The script modifies the fstab on cloned partition to the new partition structure
+
+## rpi-clone
+
+A custom versión of billw2/rpi-clone
+
+
+
+## and another utils:
+
+hass-backup
+nxtroot
+rpi-snap-log
+sudoexec/sudotask
